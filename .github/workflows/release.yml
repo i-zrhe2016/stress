@@ -2,6 +2,8 @@ name: Release
 
 on:
   push:
+    branches:
+      - "main"
     tags:
       - "v*"
   workflow_dispatch:
@@ -12,15 +14,19 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     env:
       GO111MODULE: "off"
       BINARY_NAME: cpu_memory_stress
       ASSET_NAME: cpu_memory_stress_linux_amd64
       ARCHIVE_NAME: cpu_memory_stress_linux_amd64.tar.gz
       CHECKSUM_NAME: checksums.txt
+      ROLLING_RELEASE_TAG: latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -48,10 +54,36 @@ jobs:
           tar -czf "$ARCHIVE_NAME" "$ASSET_NAME"
           sha256sum "$ARCHIVE_NAME" > "$CHECKSUM_NAME"
 
+      - name: Determine release metadata
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "RELEASE_TAG=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+            echo "RELEASE_TITLE=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+            echo "RELEASE_NOTES=Automated release for ${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+            echo "ROLLING_RELEASE=false" >> "$GITHUB_ENV"
+          else
+            short_sha="$(printf '%s' "${GITHUB_SHA}" | cut -c1-7)"
+            echo "RELEASE_TAG=${ROLLING_RELEASE_TAG}" >> "$GITHUB_ENV"
+            echo "RELEASE_TITLE=Latest build" >> "$GITHUB_ENV"
+            echo "RELEASE_NOTES=Automated build from main at ${short_sha}" >> "$GITHUB_ENV"
+            echo "ROLLING_RELEASE=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Update rolling release tag
+        if: env.ROLLING_RELEASE == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f "$RELEASE_TAG" "$GITHUB_SHA"
+          git push origin "refs/tags/$RELEASE_TAG" --force
+
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
-        with:
-          files: |
-            ${{ env.ARCHIVE_NAME }}
-            ${{ env.CHECKSUM_NAME }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$ARCHIVE_NAME" "$CHECKSUM_NAME" --clobber
+            gh release edit "$RELEASE_TAG" --title "$RELEASE_TITLE" --notes "$RELEASE_NOTES"
+          else
+            gh release create "$RELEASE_TAG" "$ARCHIVE_NAME" "$CHECKSUM_NAME" --title "$RELEASE_TITLE" --notes "$RELEASE_NOTES" --target "$GITHUB_SHA"
+          fi
