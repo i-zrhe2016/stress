@@ -3,7 +3,9 @@ package main
 import (
 	"flag"
 	"fmt"
+	"math"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path"
 	"runtime"
@@ -23,6 +25,8 @@ const (
 	maxLogLines                = 100
 	memoryChunkSize            = 64 << 20
 	defaultMemorySafetyPercent = 10
+	cpuWorkBatchSize           = 16384
+	memoryRetouchInterval      = 5 * time.Second
 )
 
 type cpuTimes struct {
@@ -43,31 +47,51 @@ type boundedLogWriter struct {
 	lines    []string
 }
 
+type lineLogger interface {
+	AppendLine(line string) error
+}
+
+type noopLogWriter struct{}
+
+func (noopLogWriter) AppendLine(string) error {
+	return nil
+}
+
 func burnCPU(stop <-chan struct{}, busy time.Duration) {
-	start := time.Now()
-	var local uint64
+	if busy <= 0 {
+		return
+	}
+
+	deadline := time.Now().Add(busy)
+	local := 1.0000001192092896
 
 	for {
+		now := time.Now()
+		if !now.Before(deadline) {
+			atomic.AddUint64(&sink, math.Float64bits(local))
+			return
+		}
+
+		for i := 0; i < cpuWorkBatchSize; i++ {
+			local += math.Sqrt(local + float64(i) + 1)
+			if local > 1<<20 {
+				local = math.Mod(local, 1024) + 1
+			}
+		}
+
 		select {
 		case <-stop:
-			atomic.AddUint64(&sink, local)
+			atomic.AddUint64(&sink, math.Float64bits(local))
 			return
 		default:
-		}
-
-		if time.Since(start) >= busy {
-			atomic.AddUint64(&sink, local)
-			return
-		}
-
-		for i := 0; i < 10000; i++ {
-			local = local*1664525 + 1013904223 + uint64(i)
 		}
 	}
 }
 
 func worker(stop <-chan struct{}, workerID int, percent int, slice time.Duration, wg *sync.WaitGroup) {
 	defer wg.Done()
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 
 	busy := time.Duration(int64(slice) * int64(percent) / 100)
 	idle := slice - busy
@@ -295,9 +319,27 @@ func detectMemoryAvailable() (uint64, error) {
 	return effectiveMemoryAvailable(systemAvailable, cgroupLimit, cgroupCurrent)
 }
 
-func releaseReservedMemory() {
+func releaseMemoryChunks(chunks [][]byte) error {
+	var firstErr error
+
+	for _, chunk := range chunks {
+		if len(chunk) == 0 {
+			continue
+		}
+		if err := syscall.Munmap(chunk); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("munmap chunk: %w", err)
+		}
+	}
+
+	return firstErr
+}
+
+func releaseReservedMemory() error {
+	err := releaseMemoryChunks(retainedMemory)
 	retainedMemory = nil
 	runtime.GC()
+
+	return err
 }
 
 func waitForDurationOrStop(stop <-chan struct{}, duration time.Duration) {
@@ -367,7 +409,17 @@ func reserveMemory(targetBytes uint64) ([][]byte, error) {
 			chunkBytes = remaining
 		}
 
-		chunk := make([]byte, int(chunkBytes))
+		chunk, err := syscall.Mmap(
+			-1,
+			0,
+			int(chunkBytes),
+			syscall.PROT_READ|syscall.PROT_WRITE,
+			syscall.MAP_PRIVATE|syscall.MAP_ANON|syscall.MAP_POPULATE,
+		)
+		if err != nil {
+			_ = releaseMemoryChunks(chunks)
+			return nil, fmt.Errorf("mmap %s: %w", formatBytes(chunkBytes), err)
+		}
 		touchMemoryPages(chunk, offset, pageSize)
 		chunks = append(chunks, chunk)
 
@@ -376,6 +428,43 @@ func reserveMemory(targetBytes uint64) ([][]byte, error) {
 	}
 
 	return chunks, nil
+}
+
+func retouchReservedMemory(chunks [][]byte) {
+	if len(chunks) == 0 {
+		return
+	}
+
+	pageSize := os.Getpagesize()
+	if pageSize < 1 {
+		pageSize = 4096
+	}
+
+	var offset uint64
+	for _, chunk := range chunks {
+		touchMemoryPages(chunk, offset, pageSize)
+		offset += uint64(len(chunk))
+	}
+}
+
+func keepMemoryResident(stop <-chan struct{}, chunks [][]byte, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	if len(chunks) == 0 {
+		return
+	}
+
+	ticker := time.NewTicker(memoryRetouchInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			retouchReservedMemory(chunks)
+		}
+	}
 }
 
 func formatBytes(bytes uint64) string {
@@ -553,7 +642,7 @@ func calculateMemoryUsagePercent(sample memoryUsage) (float64, error) {
 	return float64(sample.used) * 100 / float64(sample.total), nil
 }
 
-func logSystemUsage(stop <-chan struct{}, logWriter *boundedLogWriter, wg *sync.WaitGroup) {
+func logSystemUsage(stop <-chan struct{}, logWriter lineLogger, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	previous, err := readCPUTimes()
@@ -651,9 +740,49 @@ func formatDuration(seconds int) string {
 	return fmt.Sprintf("%ds", seconds)
 }
 
+func backgroundChildArgs(args []string) []string {
+	filtered := make([]string, 0, len(args)+1)
+	for _, arg := range args {
+		switch {
+		case arg == "-bg", arg == "--bg":
+			continue
+		case strings.HasPrefix(arg, "-bg="), strings.HasPrefix(arg, "--bg="):
+			continue
+		default:
+			filtered = append(filtered, arg)
+		}
+	}
+
+	return append(filtered, "-bg-child")
+}
+
+func startInBackground(args []string) error {
+	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", os.DevNull, err)
+	}
+	defer devNull.Close()
+
+	cmd := exec.Command(os.Args[0], backgroundChildArgs(args)...)
+	cmd.Stdin = devNull
+	cmd.Stdout = devNull
+	cmd.Stderr = devNull
+	cmd.Env = os.Environ()
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start background process: %w", err)
+	}
+	if err := cmd.Process.Release(); err != nil {
+		return fmt.Errorf("release background process: %w", err)
+	}
+
+	return nil
+}
+
 func usage() {
 	prog := os.Args[0]
-	fmt.Fprintf(os.Stderr, "Usage: %s [-t threads] [-p percent] [-total percent] [-m percent] [-d seconds] [-s slice_ms]\n\n", prog)
+	fmt.Fprintf(os.Stderr, "Usage: %s [-t threads] [-p percent] [-total percent] [-m percent] [-d seconds] [-s slice_ms] [-no-log] [-bg]\n\n", prog)
 	fmt.Fprintln(os.Stderr, "Options:")
 	fmt.Fprintln(os.Stderr, "  -t threads   Number of worker goroutines. Default: online CPU cores")
 	fmt.Fprintln(os.Stderr, "  -p percent   Target CPU load per worker (0-100). Default: 100")
@@ -664,6 +793,8 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "               Alias: -mem; when used alone, CPU load stays disabled")
 	fmt.Fprintln(os.Stderr, "  -d seconds   Run duration. Default: no limit. Use 0 for no limit")
 	fmt.Fprintln(os.Stderr, "  -s slice_ms  Control interval in milliseconds. Default: 100")
+	fmt.Fprintln(os.Stderr, "  -no-log      Disable file logging")
+	fmt.Fprintln(os.Stderr, "  -bg          Run in background and detach from the terminal")
 	fmt.Fprintln(os.Stderr, "  -h           Show this help")
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintln(os.Stderr, "Examples:")
@@ -671,6 +802,8 @@ func usage() {
 	fmt.Fprintf(os.Stderr, "  %s -t 8 -p 70\n", prog)
 	fmt.Fprintf(os.Stderr, "  %s -total 65\n", prog)
 	fmt.Fprintf(os.Stderr, "  %s -m 30 -d 60\n", prog)
+	fmt.Fprintf(os.Stderr, "  %s -total 65 -no-log\n", prog)
+	fmt.Fprintf(os.Stderr, "  %s -total 65 -bg\n", prog)
 }
 
 func main() {
@@ -683,6 +816,9 @@ func main() {
 	flag.IntVar(memoryPercent, "mem", 0, "")
 	duration := flag.Int("d", 0, "")
 	sliceMS := flag.Int("s", 100, "")
+	noLog := flag.Bool("no-log", false, "")
+	background := flag.Bool("bg", false, "")
+	backgroundChild := flag.Bool("bg-child", false, "")
 	help := flag.Bool("h", false, "")
 
 	flag.Usage = usage
@@ -716,6 +852,13 @@ func main() {
 	if *sliceMS < 1 {
 		fmt.Fprintf(os.Stderr, "invalid slice_ms: %d\n", *sliceMS)
 		os.Exit(1)
+	}
+	if *background && !*backgroundChild {
+		if err := startInBackground(os.Args[1:]); err != nil {
+			fmt.Fprintf(os.Stderr, "start background mode failed: %v\n", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	detectedCPUs := detectLogicalCPUs()
@@ -780,16 +923,20 @@ func main() {
 	}
 	runtime.GOMAXPROCS(gomaxprocs)
 
-	logPath, err := defaultLogPath()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "resolve log path failed: %v\n", err)
-		os.Exit(1)
-	}
+	logWriter := lineLogger(noopLogWriter{})
+	var err error
+	if !*noLog {
+		logPath, err := defaultLogPath()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "resolve log path failed: %v\n", err)
+			os.Exit(1)
+		}
 
-	logWriter, err := newBoundedLogWriter(logPath, maxLogLines)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "initialize log file failed: %v\n", err)
-		os.Exit(1)
+		logWriter, err = newBoundedLogWriter(logPath, maxLogLines)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "initialize log file failed: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	if memoryTargetBytes > 0 {
@@ -801,7 +948,7 @@ func main() {
 	}
 
 	if err := logWriter.AppendLine(fmt.Sprintf(
-		"%s started cpu_mode=%s logical_cpus=%d workers=%d duration=%s slice=%dms log_interval=%s",
+		"%s started cpu_mode=%s cpu_method=duty_cycle_busy_loop memory_method=anonymous_mmap logical_cpus=%d workers=%d duration=%s slice=%dms log_interval=%s",
 		time.Now().UTC().Format(time.RFC3339),
 		cpuMode,
 		detectedCPUs,
@@ -857,8 +1004,14 @@ func main() {
 	}()
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go logSystemUsage(stop, logWriter, &wg)
+	if !*noLog {
+		wg.Add(1)
+		go logSystemUsage(stop, logWriter, &wg)
+	}
+	if len(retainedMemory) > 0 {
+		wg.Add(1)
+		go keepMemoryResident(stop, retainedMemory, &wg)
+	}
 
 	slice := time.Duration(*sliceMS) * time.Millisecond
 	for i, workerPercent := range workerPercents {
@@ -873,8 +1026,10 @@ func main() {
 		<-stop
 	}
 
-	releaseReservedMemory()
 	wg.Wait()
+	if err := releaseReservedMemory(); err != nil {
+		fmt.Fprintf(os.Stderr, "release memory failed: %v\n", err)
+	}
 	if err := logWriter.AppendLine(fmt.Sprintf("%s stopped sink=%d", time.Now().UTC().Format(time.RFC3339), atomic.LoadUint64(&sink))); err != nil {
 		fmt.Fprintf(os.Stderr, "write stop log failed: %v\n", err)
 	}

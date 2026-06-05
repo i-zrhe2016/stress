@@ -6,6 +6,7 @@ import (
 	"path"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -59,6 +60,26 @@ func TestBoundedLogWriterKeepsLatestLines(t *testing.T) {
 	}
 	if lines[len(lines)-1] != "line-106" {
 		t.Fatalf("last bounded line = %q, want %q", lines[len(lines)-1], "line-106")
+	}
+}
+
+func TestNoopLogWriterAppendLine(t *testing.T) {
+	t.Parallel()
+
+	var writer noopLogWriter
+	if err := writer.AppendLine("ignored"); err != nil {
+		t.Fatalf("AppendLine returned error: %v", err)
+	}
+}
+
+func TestBackgroundChildArgs(t *testing.T) {
+	t.Parallel()
+
+	got := backgroundChildArgs([]string{"-total", "65", "-bg", "-no-log"})
+	want := []string{"-total", "65", "-no-log", "-bg-child"}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("backgroundChildArgs returned %v, want %v", got, want)
 	}
 }
 
@@ -603,6 +624,81 @@ func TestPlanMemoryLoadRejectsInvalidInput(t *testing.T) {
 				t.Fatalf("planMemoryLoad(%d, %d) unexpectedly succeeded", tt.percent, tt.totalBytes)
 			}
 		})
+	}
+}
+
+func TestReserveMemory(t *testing.T) {
+	t.Parallel()
+
+	chunks, err := reserveMemory(8192)
+	if err != nil {
+		t.Fatalf("reserveMemory returned error: %v", err)
+	}
+	defer func() {
+		if err := releaseMemoryChunks(chunks); err != nil {
+			t.Fatalf("releaseMemoryChunks returned error: %v", err)
+		}
+	}()
+
+	if len(chunks) != 1 {
+		t.Fatalf("reserveMemory chunk count = %d, want 1", len(chunks))
+	}
+	if len(chunks[0]) != 8192 {
+		t.Fatalf("reserveMemory chunk size = %d, want 8192", len(chunks[0]))
+	}
+
+	nonZero := false
+	for _, b := range chunks[0] {
+		if b != 0 {
+			nonZero = true
+			break
+		}
+	}
+	if !nonZero {
+		t.Fatal("reserveMemory did not touch mapped pages")
+	}
+}
+
+func TestRetouchReservedMemory(t *testing.T) {
+	t.Parallel()
+
+	chunks, err := reserveMemory(8192)
+	if err != nil {
+		t.Fatalf("reserveMemory returned error: %v", err)
+	}
+	defer func() {
+		if err := releaseMemoryChunks(chunks); err != nil {
+			t.Fatalf("releaseMemoryChunks returned error: %v", err)
+		}
+	}()
+
+	chunks[0][0] = 0
+	retouchReservedMemory(chunks)
+
+	if chunks[0][0] == 0 {
+		t.Fatal("retouchReservedMemory did not rewrite touched page")
+	}
+}
+
+func TestKeepMemoryResidentStops(t *testing.T) {
+	t.Parallel()
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		keepMemoryResident(stop, nil, &wg)
+		close(done)
+	}()
+
+	wg.Wait()
+
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("keepMemoryResident did not exit for empty chunks")
 	}
 }
 
