@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GO111MODULE: "off"
+      BINARY_NAME: cpu_memory_stress
+      ASSET_NAME: cpu_memory_stress_linux_amd64
+      ARCHIVE_NAME: cpu_memory_stress_linux_amd64.tar.gz
+      CHECKSUM_NAME: checksums.txt
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l cpu_memory_stress.go cpu_memory_stress_test.go)"
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Run tests
+        run: go test
+
+      - name: Build release binary
+        run: |
+          GOOS=linux GOARCH=amd64 go build -o "$ASSET_NAME" cpu_memory_stress.go
+
+      - name: Package release assets
+        run: |
+          tar -czf "$ARCHIVE_NAME" "$ASSET_NAME"
+          sha256sum "$ARCHIVE_NAME" > "$CHECKSUM_NAME"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            ${{ env.ARCHIVE_NAME }}
+            ${{ env.CHECKSUM_NAME }}
